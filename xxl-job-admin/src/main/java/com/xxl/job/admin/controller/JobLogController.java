@@ -1,15 +1,18 @@
 package com.xxl.job.admin.controller;
 
-import com.xxl.job.admin.core.conf.XxlJobScheduler;
+import com.xxl.job.admin.core.complete.XxlJobCompleter;
 import com.xxl.job.admin.core.exception.XxlJobException;
 import com.xxl.job.admin.core.model.XxlJobGroup;
 import com.xxl.job.admin.core.model.XxlJobInfo;
 import com.xxl.job.admin.core.model.XxlJobLog;
+import com.xxl.job.admin.core.scheduler.XxlJobScheduler;
 import com.xxl.job.admin.core.util.I18nUtil;
 import com.xxl.job.admin.dao.XxlJobGroupDao;
 import com.xxl.job.admin.dao.XxlJobInfoDao;
 import com.xxl.job.admin.dao.XxlJobLogDao;
 import com.xxl.job.core.biz.ExecutorBiz;
+import com.xxl.job.core.biz.model.KillParam;
+import com.xxl.job.core.biz.model.LogParam;
 import com.xxl.job.core.biz.model.LogResult;
 import com.xxl.job.core.biz.model.ReturnT;
 import com.xxl.job.core.util.DateUtil;
@@ -17,9 +20,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Controller;
 import org.springframework.ui.Model;
+import org.springframework.util.StringUtils;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.ResponseBody;
+import org.springframework.web.util.HtmlUtils;
 
 import javax.annotation.Resource;
 import javax.servlet.http.HttpServletRequest;
@@ -96,7 +101,7 @@ public class JobLogController {
 		Date triggerTimeEnd = null;
 		if (filterTime!=null && filterTime.trim().length()>0) {
 			String[] temp = filterTime.split(" - ");
-			if (temp!=null && temp.length == 2) {
+			if (temp.length == 2) {
 				triggerTimeStart = DateUtil.parseDateTime(temp[0]);
 				triggerTimeEnd = DateUtil.parseDateTime(temp[1]);
 			}
@@ -126,26 +131,37 @@ public class JobLogController {
 
         model.addAttribute("triggerCode", jobLog.getTriggerCode());
         model.addAttribute("handleCode", jobLog.getHandleCode());
-        model.addAttribute("executorAddress", jobLog.getExecutorAddress());
-        model.addAttribute("triggerTime", jobLog.getTriggerTime().getTime());
         model.addAttribute("logId", jobLog.getId());
 		return "joblog/joblog.detail";
 	}
 
 	@RequestMapping("/logDetailCat")
 	@ResponseBody
-	public ReturnT<LogResult> logDetailCat(String executorAddress, long triggerTime, long logId, int fromLineNum){
+	public ReturnT<LogResult> logDetailCat(long logId, int fromLineNum){
 		try {
-			ExecutorBiz executorBiz = XxlJobScheduler.getExecutorBiz(executorAddress);
-			ReturnT<LogResult> logResult = executorBiz.log(triggerTime, logId, fromLineNum);
+			// valid
+			XxlJobLog jobLog = xxlJobLogDao.load(logId);	// todo, need to improve performance
+			if (jobLog == null) {
+				return new ReturnT<LogResult>(ReturnT.FAIL_CODE, I18nUtil.getString("joblog_logid_unvalid"));
+			}
+
+			// log cat
+			ExecutorBiz executorBiz = XxlJobScheduler.getExecutorBiz(jobLog.getExecutorAddress());
+			ReturnT<LogResult> logResult = executorBiz.log(new LogParam(jobLog.getTriggerTime().getTime(), logId, fromLineNum));
 
 			// is end
             if (logResult.getContent()!=null && logResult.getContent().getFromLineNum() > logResult.getContent().getToLineNum()) {
-                XxlJobLog jobLog = xxlJobLogDao.load(logId);
                 if (jobLog.getHandleCode() > 0) {
                     logResult.getContent().setEnd(true);
                 }
             }
+
+			// fix xss
+			if (logResult.getContent()!=null && StringUtils.hasText(logResult.getContent().getLogContent())) {
+				String newLogContent = logResult.getContent().getLogContent();
+				newLogContent = HtmlUtils.htmlEscape(newLogContent, "UTF-8");
+				logResult.getContent().setLogContent(newLogContent);
+			}
 
 			return logResult;
 		} catch (Exception e) {
@@ -171,7 +187,7 @@ public class JobLogController {
 		ReturnT<String> runResult = null;
 		try {
 			ExecutorBiz executorBiz = XxlJobScheduler.getExecutorBiz(log.getExecutorAddress());
-			runResult = executorBiz.kill(jobInfo.getId());
+			runResult = executorBiz.kill(new KillParam(jobInfo.getId()));
 		} catch (Exception e) {
 			logger.error(e.getMessage(), e);
 			runResult = new ReturnT<String>(500, e.getMessage());
@@ -181,7 +197,7 @@ public class JobLogController {
 			log.setHandleCode(ReturnT.FAIL_CODE);
 			log.setHandleMsg( I18nUtil.getString("joblog_kill_log_byman")+":" + (runResult.getMsg()!=null?runResult.getMsg():""));
 			log.setHandleTime(new Date());
-			xxlJobLogDao.updateHandleInfo(log);
+			XxlJobCompleter.updateHandleInfoAndFinish(log);
 			return new ReturnT<String>(runResult.getMsg());
 		} else {
 			return new ReturnT<String>(500, runResult.getMsg());
@@ -216,7 +232,14 @@ public class JobLogController {
 			return new ReturnT<String>(ReturnT.FAIL_CODE, I18nUtil.getString("joblog_clean_type_unvalid"));
 		}
 
-		xxlJobLogDao.clearLog(jobGroup, jobId, clearBeforeTime, clearBeforeNum);
+		List<Long> logIds = null;
+		do {
+			logIds = xxlJobLogDao.findClearLogIds(jobGroup, jobId, clearBeforeTime, clearBeforeNum, 1000);
+			if (logIds!=null && logIds.size()>0) {
+				xxlJobLogDao.clearLog(logIds);
+			}
+		} while (logIds!=null && logIds.size()>0);
+
 		return ReturnT.SUCCESS;
 	}
 
